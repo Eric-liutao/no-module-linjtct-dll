@@ -51,6 +51,13 @@ typedef NTSTATUS(WINAPI* NTALLOCATEVIRTUALMEMORY)(
     IN ULONG Protect
     );
 
+typedef INT(WINAPI* MESSAGEBOXA)(
+    _In_opt_ HWND    hWnd,
+    _In_opt_ LPCSTR lpText,
+    _In_opt_ LPCSTR lpCaption,
+    _In_     UINT    uType
+    );
+
 typedef struct _INJECTPARAM
 {
     PVOID lpFileData;      // 我们要注射的DLL内容
@@ -64,12 +71,15 @@ typedef struct _INJECTPARAM
     RTLINITANSISTRING            Func_RtlInitAnsiString;
     RTLANSISTRINGTOUNICODESTRING Func_RtlAnsiStringToUnicodeString;
     RTLFREEUNICODESTRING         Func_RtlFreeUnicodeString;
+
+    MESSAGEBOXA                    Func_MessageBoxA;
+
 } INJECTPARAM;
 
 
 class Injectdll
 {
 	public:
-		void RemoteMapLoadDll(HANDLE targectprocess);
+		void RemoteMapLoadDll(HANDLE TargetProcess);
 }; 
 

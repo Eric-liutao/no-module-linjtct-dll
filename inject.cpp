@@ -7,8 +7,9 @@
 
 
 
-ULONG_PTR WINAPI MemoryLoadLibrary(INJECTPARAM* InjectParam)
+ULONG_PTR WINAPI MemoryLoadLibrary_Begin(INJECTPARAM* InjectParam)
 {
+	
     // 获取注入参数
     LPVOID lpFileData = InjectParam->lpFileData;
     DWORD dwDataLength = InjectParam->dwDataLength;
@@ -20,7 +21,7 @@ ULONG_PTR WINAPI MemoryLoadLibrary(INJECTPARAM* InjectParam)
     RTLINITANSISTRING Func_RtlInitAnsiString = InjectParam->Func_RtlInitAnsiString;
     RTLANSISTRINGTOUNICODESTRING Func_RtlAnsiStringToUnicodeString = InjectParam->Func_RtlAnsiStringToUnicodeString;
     RTLFREEUNICODESTRING Func_RtlFreeUnicodeString = InjectParam->Func_RtlFreeUnicodeString;
-    
+    MESSAGEBOXA Func_MessageBoxA = InjectParam->Func_MessageBoxA;
     // 初始化DLL入口点函数指针
     DLLMAIN Func_DllMain = NULL;
     PVOID pMemoryAddress = NULL;
@@ -104,20 +105,15 @@ ULONG_PTR WINAPI MemoryLoadLibrary(INJECTPARAM* InjectParam)
 				//得到该节的大小
 				int VirtualSize = pSectionHeader[i].Misc.VirtualSize;
 				int SizeOfRawData = pSectionHeader[i].SizeOfRawData;
-				//取较大值	
-				if (VirtualSize < SizeOfRawData)
-				{
-					VirtualSize = SizeOfRawData;
-				}
+				int MaxSize = (SizeOfRawData > VirtualSize)? SizeOfRawData:VirtualSize;
 
 				int SectionSize = (pSectionHeader[i].VirtualAddress + VirtualSize + nAlign - 1) / nAlign * nAlign;
 					
-				if (ImageSize < SectionSize)
+				if(ImageSize < SectionSize)
 				{
-					ImageSize = SectionSize; //取的最后的Section的地址+大小(跑到文件最后的末尾了)
+					ImageSize = SectionSize;
 				}
 
-				printf("ImageSize[2]: 0x%X\r\n", ImageSize);
 
 				if (ImageSize == 0)
 				{
@@ -128,38 +124,8 @@ ULONG_PTR WINAPI MemoryLoadLibrary(INJECTPARAM* InjectParam)
 				Func_NtAllocateVirtualMemory((HANDLE) -1, &pMemoryAddress, 0, &uSize, MEM_COMMIT , PAGE_EXECUTE_READWRITE);
 				if(pMemoryAddress != NULL)
 				{
-									// 复制头部
-									RtlCopyMemory(pMemoryAddress, lpFileData, HeaderSize);
-
-									// 复制各个节
-									for (int i = 0; i < pNtHeader->FileHeader.NumberOfSections; i++)
-									{
-										PBYTE pSectionDest = reinterpret_cast<PBYTE>(pMemoryAddress) + pSectionHeader[i].VirtualAddress;
-										PBYTE pSectionSrc = reinterpret_cast<PBYTE>(lpFileData) + pSectionHeader[i].PointerToRawData;
-										RtlCopyMemory(
-											pSectionDest,
-											pSectionSrc,
-											pSectionHeader[i].SizeOfRawData
-										);
-									}
-
-									// 获取入口点函数地址
-									Func_LdrGetProcedureAddress(
-										pMemoryAddress,
-										NULL,
-										pNtHeader->OptionalHeader.AddressOfEntryPoint,
-										reinterpret_cast<FARPROC*>(&Func_DllMain)
-									);
-
-									if (Func_DllMain != NULL)
-									{
-										// 调用DLL入口点函数
-										Func_DllMain(
-											pMemoryAddress,
-											DLL_PROCESS_ATTACH,
-											NULL
-										);
-									}
+					Func_MessageBoxA(NULL, NULL, NULL, MB_OK);
+					// 这里可以继续实现映像加载的其他步骤，例如拷贝节数据、处理重定位、解析导入表等。
 				}
 			}
 		}
@@ -168,21 +134,35 @@ ULONG_PTR WINAPI MemoryLoadLibrary(INJECTPARAM* InjectParam)
 	return 0;
 }
 
-
-
-
-
-void Injectdll::RemoteMapLoadDll(HANDLE targectprocess)
+void MemoryLoadLibrary_End()
 {
 
+}
+
+
+
+void Injectdll::RemoteMapLoadDll(HANDLE TargetProcess)
+{
+	SIZE_T dwWrited = 0;
 	INJECTPARAM InjectParam;
+
 	RtlZeroMemory(&InjectParam, sizeof(InjectParam));
 
-	//WORD pShellCodeBegin
+	DWORD dwFileSize = sizeof(DllX64);
 
+	WORD *pShellCodeBegin = (WORD *)MemoryLoadLibrary_Begin;
 
+	DWORD ShellCodeSize = 0;
 
-	InjectParam.dwDataLength = sizeof(DllX64);
+	// 计算ShellCode大小
+	ShellCodeSize = (ULONG_PTR)MemoryLoadLibrary_End - (ULONG_PTR)MemoryLoadLibrary_Begin;
+	printf("ShellCodeSize:%d\r\n", ShellCodeSize);
+
+	PBYTE pShellCodeBuffer = (PBYTE)malloc(ShellCodeSize);
+	RtlZeroMemory(pShellCodeBuffer, ShellCodeSize);
+	RtlCopyMemory(pShellCodeBuffer, pShellCodeBegin, ShellCodeSize);
+
+	InjectParam.dwDataLength = dwFileSize;
 
 	HMODULE hNtDll = GetModuleHandleA("ntdll.dll");
 
@@ -193,6 +173,11 @@ void Injectdll::RemoteMapLoadDll(HANDLE targectprocess)
 	InjectParam.Func_RtlAnsiStringToUnicodeString = (RTLANSISTRINGTOUNICODESTRING)GetProcAddress(hNtDll, "RtlAnsiStringToUnicodeString");
 	InjectParam.Func_RtlFreeUnicodeString = (RTLFREEUNICODESTRING)GetProcAddress(hNtDll, "RtlFreeUnicodeString");
 
+	HMODULE hUser32 = LoadLibrary("User32.dll");
+	InjectParam.Func_MessageBoxA = (MESSAGEBOXA)GetProcAddress(hUser32, "MessageBoxA");
+
+
+
 	printf("LdrGetProcedureAddress:%p\r\n", InjectParam.Func_LdrGetProcedureAddress);
 	printf("NtAllocateVirtualMemory:%p\r\n", InjectParam.Func_NtAllocateVirtualMemory);
 	printf("LdrLoadDll:%p\r\n", InjectParam.Func_LdrLoadDll);
@@ -200,14 +185,13 @@ void Injectdll::RemoteMapLoadDll(HANDLE targectprocess)
 	printf("RtlAnsiStringToUnicodeString:%p\r\n", InjectParam.Func_RtlAnsiStringToUnicodeString);
 	printf("RtlFreeUnicodeString:%p\r\n", InjectParam.Func_RtlFreeUnicodeString);
 
-	SIZE_T dwWrited = 0;
-	DWORD ShellCodeSize = 0;
+
 	// 申请内存，把Shellcode和DLL数据，和参数复制到目标进程
 // 安全起见，大小多加0x100
 	PBYTE pStartAddress = (PBYTE)VirtualAllocEx(
-		targectprocess,
+		TargetProcess,
 		0,
-		InjectParam.dwDataLength + 0x100 + sizeof(InjectParam)+ShellCodeSize,
+		dwFileSize + 0x100 + ShellCodeSize+ sizeof(InjectParam),
 		MEM_COMMIT,
 		PAGE_EXECUTE_READWRITE
 	);
@@ -218,13 +202,25 @@ void Injectdll::RemoteMapLoadDll(HANDLE targectprocess)
 
 	// DLL数据写入到目标
 	WriteProcessMemory(
-		targectprocess,
+		TargetProcess,
 		pStartAddress,
 		DllX64,
-		InjectParam.dwDataLength,
+		dwFileSize,
 		&dwWrited
 	);
 
+	PBYTE ShellCodeAddress = pStartAddress + dwFileSize + 0x100;
+	printf("ShellCode写入的位置:0x%p\r\n", ShellCodeAddress);
+	WriteProcessMemory(TargetProcess, ShellCodeAddress, pShellCodeBuffer, ShellCodeSize, &dwWrited); //写入ShellCode
+	//------------------
+	PBYTE ShellCodeParamAddress = pStartAddress + dwFileSize + 0x100 + ShellCodeSize;
+	WriteProcessMemory(TargetProcess, ShellCodeParamAddress, &InjectParam, sizeof(InjectParam), &dwWrited); //写入参数
+	//------------------
+	HANDLE hRemoteThread = CreateRemoteThread(TargetProcess, 0, 0, (LPTHREAD_START_ROUTINE)ShellCodeAddress, ShellCodeParamAddress, 0, 0);
+	if (hRemoteThread)
+	{
+		CloseHandle(hRemoteThread);
+	}
 	printf("写入DLL内容完毕\r\n");
 
 }
