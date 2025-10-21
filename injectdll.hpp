@@ -73,6 +73,12 @@ typedef struct _INJECTPARAM
     RTLFREEUNICODESTRING         Func_RtlFreeUnicodeString;
 
     MESSAGEBOXA                    Func_MessageBoxA;
+    DWORD                          dwRemoteStatus; // status code written by remote shellcode (0 = success)
+    // Pointers (remote addresses) to ASCII names placed in the remote param block
+    char*                         Name_GetProcAddress;
+    char*                         Name_LoadLibraryA;
+    char*                         Name_VirtualAlloc;
+    char*                         Name_VirtualProtect;
 
 } INJECTPARAM;
 
@@ -82,4 +88,7 @@ class Injectdll
 	public:
 		void RemoteMapLoadDll(HANDLE TargetProcess);
 }; 
+
+// external binary blob declared in dllbin.h
+extern unsigned char DllX64[];
 

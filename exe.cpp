@@ -2,26 +2,27 @@
 //
 
 #include <iostream>
+#include <wchar.h>
 #include "injectdll.hpp"
 
-// Get ProcessId By Name
-std::uint32_t GetProcessId(__in const std::basic_string<char>& Name)
+// Get ProcessId By Name (wide-char aware)
+std::uint32_t GetProcessId(__in const std::basic_string<wchar_t>& Name)
 {
-    PROCESSENTRY32 ProcessEntry;
-    ProcessEntry.dwSize = sizeof(PROCESSENTRY32);
+    PROCESSENTRY32W ProcessEntry;
+    ProcessEntry.dwSize = sizeof(PROCESSENTRY32W);
 
     auto ProcessSnapshot = ::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, NULL);
 
-    if (Process32First(ProcessSnapshot, &ProcessEntry))
+    if (Process32FirstW(ProcessSnapshot, &ProcessEntry))
     {
         do
         {
-            if (!strcmp(ProcessEntry.szExeFile, Name.data()))
+            if (wcscmp(ProcessEntry.szExeFile, Name.c_str()) == 0)
             {
                 CloseHandle(ProcessSnapshot);
                 return ProcessEntry.th32ProcessID;
             }
-        } while (Process32Next(ProcessSnapshot, &ProcessEntry));
+        } while (Process32NextW(ProcessSnapshot, &ProcessEntry));
     }
     CloseHandle(ProcessSnapshot);
     return 0;
@@ -57,7 +58,7 @@ int main()
 {
     AdjustPrivileges();
     // 假设已经定义了GetProcessId函数和InjectDll类
-    auto DwmPID = GetProcessId("QQ.exe");
+    auto DwmPID = GetProcessId(L"dwm.exe");
     auto hProcess = OpenProcess(
         PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION |
         PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ,
