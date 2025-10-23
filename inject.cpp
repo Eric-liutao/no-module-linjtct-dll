@@ -10,17 +10,19 @@ extern unsigned char DllX64[59904];
 
 
 
+__declspec(safebuffers)
+__declspec(noinline)
 ULONG_PTR WINAPI MemoryLoadLibrary_Begin(INJECTPARAM* InjectParam)
 {
 	
-    // // 获取注入参数
-	// Remote-resolve shellcode (x64):
-	// - Resolve kernel32 base via PEB
-	// - Parse kernel32 export table to get GetProcAddress
-	// - Use GetProcAddress to get LoadLibraryA, VirtualAlloc, VirtualProtect, etc.
-	// - Manual-map the DLL pointed to by InjectParam->lpFileData into allocated memory
-	// - Perform relocations and import resolution
-	// - Call DllMain(DLL_PROCESS_ATTACH)
+	// Manual-map shellcode (x64) high-level steps:
+	// 1) Resolve kernel32 base via PEB->Ldr; parse export to get GetProcAddress
+	// 2) Resolve LoadLibraryA, VirtualAlloc, VirtualProtect via GetProcAddress
+	// 3) Parse PE file in InjectParam->lpFileData: validate DOS/NT headers
+	// 4) Allocate image-sized memory; copy headers and sections
+	// 5) Apply base relocations (if ImageBase != allocation)
+	// 6) Resolve imports: Load dependency DLLs with LoadLibraryA and fill IAT via GetProcAddress
+	// 7) Optionally call DllMain(DLL_PROCESS_ATTACH) (guarded by SkipCallDllMain)
 
 	// Basic safety checks
 	if (!InjectParam)
@@ -28,6 +30,9 @@ ULONG_PTR WINAPI MemoryLoadLibrary_Begin(INJECTPARAM* InjectParam)
 
 	// initialize remote status (0 == success)
 	InjectParam->dwRemoteStatus = 0;
+	// earliest checkpoint: entered shellcode
+	InjectParam->dwRemoteStatus = 19;
+	// Respect host-provided SkipCallDllMain (do not override here)
 
 	// helper macro to set remote status and return from shellcode
 #define SET_STATUS_AND_RETURN(code) do { if (InjectParam) InjectParam->dwRemoteStatus = (DWORD)(code); return (ULONG_PTR)(code); } while(0)
@@ -75,83 +80,58 @@ ULONG_PTR WINAPI MemoryLoadLibrary_Begin(INJECTPARAM* InjectParam)
 
 	// Note: avoid lambdas or external helper calls here; implement logic inline where needed
 
-	// Walk loader list to find kernel32.dll base
-	PVOID kernel32Base = NULL;
+	// Prepare to scan exports of loaded modules (no dependency on kernel32 name)
+	PVOID kernel32Base = NULL; // optional: module that provides GetProcAddress
 	PPEB_LDR_DATA_LOCAL ldr = peb->Ldr;
-	if (ldr)
+	if (InjectParam) InjectParam->dwRemoteStatus = 200; // got Ldr
+
+	// Resolve GetProcAddress by scanning all loaded modules' exports and comparing to InjectParam->Name_GetProcAddress
+	FARPROC pGetProc = NULL;
+	if (!ldr || !InjectParam || !InjectParam->Name_GetProcAddress)
+		SET_STATUS_AND_RETURN(4);
 	{
 		PLIST_ENTRY head = &ldr->InLoadOrderModuleList;
-		for (PLIST_ENTRY cur = head->Flink; cur != head; cur = cur->Flink)
+		PLIST_ENTRY cur = head ? head->Flink : NULL;
+		int guard2 = 0;
+		if (InjectParam) InjectParam->dwRemoteStatus = 220; // start scanning modules for GetProcAddress
+		for (; cur && cur != head && guard2 < 1024 && !pGetProc; cur = cur->Flink, ++guard2)
 		{
+			if (InjectParam) InjectParam->dwRemoteStatus = 221; // have module
 			PLDR_DATA_TABLE_ENTRY_LOCAL entry = CONTAINING_RECORD(cur, LDR_DATA_TABLE_ENTRY_LOCAL, InLoadOrderLinks);
-			if (entry && entry->BaseDllName.Buffer)
+			PVOID modBase = entry ? entry->DllBase : NULL;
+			if (!modBase) continue;
+			PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)modBase;
+			if (dos->e_magic != IMAGE_DOS_SIGNATURE) continue;
+			PIMAGE_NT_HEADERS64 nt = (PIMAGE_NT_HEADERS64)((PBYTE)modBase + dos->e_lfanew);
+			if (nt->Signature != IMAGE_NT_SIGNATURE) continue;
+			IMAGE_DATA_DIRECTORY expDir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+			if (expDir.VirtualAddress == 0) continue;
+			PIMAGE_EXPORT_DIRECTORY exp = (PIMAGE_EXPORT_DIRECTORY)((PBYTE)modBase + expDir.VirtualAddress);
+			DWORD* names = (DWORD*)((PBYTE)modBase + exp->AddressOfNames);
+			WORD* ords = (WORD*)((PBYTE)modBase + exp->AddressOfNameOrdinals);
+			DWORD* funcs = (DWORD*)((PBYTE)modBase + exp->AddressOfFunctions);
+			if (InjectParam) InjectParam->dwRemoteStatus = 222; // scanning names
+			for (DWORD i = 0; i < exp->NumberOfNames && !pGetProc; i++)
 			{
-				if (entry->BaseDllName.Buffer)
+				const char* curName = (const char*)((PBYTE)modBase + names[i]);
+				const char* a = curName;
+				const char* b = InjectParam->Name_GetProcAddress;
+				int eq = 1;
+				while (*a && *b) { if (*a != *b) { eq = 0; break; } a++; b++; }
+				if (eq && *a == 0 && *b == 0)
 				{
-					// inline ascii case-insensitive compare for L"kernel32.dll"
-					const wchar_t* a = entry->BaseDllName.Buffer;
-					const wchar_t* b = L"kernel32.dll";
-					int eq = 1;
-					while (*a && *b)
-					{
-						wchar_t ca = *a;
-						wchar_t cb = *b;
-						if (ca >= L'A' && ca <= L'Z') ca = ca - L'A' + L'a';
-						if (cb >= L'A' && cb <= L'Z') cb = cb - L'A' + L'a';
-						if (ca != cb) { eq = 0; break; }
-						++a; ++b;
-					}
-					if (eq && *a == 0 && *b == 0)
-					{
-						kernel32Base = entry->DllBase;
-						break;
-					}
+					DWORD funcRVA = funcs[ords[i]];
+					pGetProc = (FARPROC)((PBYTE)modBase + funcRVA);
+					kernel32Base = modBase; // remember module holding GetProcAddress
+					if (InjectParam) InjectParam->dwRemoteStatus = 223; // found GetProcAddress
+					break;
 				}
 			}
 		}
 	}
-
-	if (!kernel32Base)
-		SET_STATUS_AND_RETURN(3);
-
-	// checkpoint: kernel32 located
-	if (InjectParam) InjectParam->dwRemoteStatus = 21;
-
-	// Helper: find export by name
-	auto FindExport = [&](PVOID moduleBase, const char* name)->FARPROC {
-	PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)moduleBase;
-		if (dos->e_magic != IMAGE_DOS_SIGNATURE) return NULL;
-		PIMAGE_NT_HEADERS64 nt = (PIMAGE_NT_HEADERS64)((PBYTE)moduleBase + dos->e_lfanew);
-		if (nt->Signature != IMAGE_NT_SIGNATURE) return NULL;
-		IMAGE_DATA_DIRECTORY expDir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
-		if (expDir.VirtualAddress == 0) return NULL;
-		PIMAGE_EXPORT_DIRECTORY exp = (PIMAGE_EXPORT_DIRECTORY)((PBYTE)moduleBase + expDir.VirtualAddress);
-		DWORD* names = (DWORD*)((PBYTE)moduleBase + exp->AddressOfNames);
-		WORD* ords = (WORD*)((PBYTE)moduleBase + exp->AddressOfNameOrdinals);
-		DWORD* funcs = (DWORD*)((PBYTE)moduleBase + exp->AddressOfFunctions);
-		for (DWORD i = 0; i < exp->NumberOfNames; i++)
-		{
-			const char* curName = (const char*)((PBYTE)moduleBase + names[i]);
-			// compare
-			const char* a = curName;
-			const char* b = name;
-			int eq = 1;
-			while (*a && *b) { if (*a != *b) { eq = 0; break; } a++; b++; }
-			if (eq && *a == 0 && *b == 0)
-			{
-				DWORD funcRVA = funcs[ords[i]];
-				return (FARPROC)((PBYTE)moduleBase + funcRVA);
-			}
-		}
-		return NULL;
-	};
-
-	// Resolve GetProcAddress from kernel32
-	FARPROC pGetProc = FindExport(kernel32Base, "GetProcAddress");
 	if (!pGetProc)
 		SET_STATUS_AND_RETURN(4);
-
-	// checkpoint: GetProcAddress resolved
+	// checkpoint: GetProcAddress resolved (22)
 	if (InjectParam) InjectParam->dwRemoteStatus = 22;
 
 	typedef FARPROC(WINAPI* tGetProcAddress)(HMODULE, LPCSTR);
@@ -159,9 +139,9 @@ ULONG_PTR WINAPI MemoryLoadLibrary_Begin(INJECTPARAM* InjectParam)
 
 	// Use GetProcAddress to get other API addresses
 	tGetProcAddress gp = GetProcAddress_remote;
-	FARPROC pLoadLibraryA = gp((HMODULE)kernel32Base, "LoadLibraryA");
-	FARPROC pVirtualAlloc = gp((HMODULE)kernel32Base, "VirtualAlloc");
-	FARPROC pVirtualProtect = gp((HMODULE)kernel32Base, "VirtualProtect");
+	FARPROC pLoadLibraryA = gp((HMODULE)kernel32Base, InjectParam->Name_LoadLibraryA);
+	FARPROC pVirtualAlloc = gp((HMODULE)kernel32Base, InjectParam->Name_VirtualAlloc);
+	FARPROC pVirtualProtect = gp((HMODULE)kernel32Base, InjectParam->Name_VirtualProtect);
 
 	if (!pLoadLibraryA || !pVirtualAlloc || !pVirtualProtect)
 		SET_STATUS_AND_RETURN(5);
@@ -183,10 +163,31 @@ ULONG_PTR WINAPI MemoryLoadLibrary_Begin(INJECTPARAM* InjectParam)
 
 	PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)lpFileData;
 	if (pDos->e_magic != IMAGE_DOS_SIGNATURE) SET_STATUS_AND_RETURN(7);
+	// bounds: e_lfanew must fit within file buffer
+	if ((SIZE_T)pDos->e_lfanew + sizeof(IMAGE_NT_HEADERS64) > dwDataLength) SET_STATUS_AND_RETURN(13);
 	PIMAGE_NT_HEADERS64 pNt = (PIMAGE_NT_HEADERS64)(lpFileData + pDos->e_lfanew);
 	if (pNt->Signature != IMAGE_NT_SIGNATURE) SET_STATUS_AND_RETURN(8);
 
 	SIZE_T imageSize = pNt->OptionalHeader.SizeOfImage;
+	if (imageSize == 0) SET_STATUS_AND_RETURN(16);
+
+	// Ensure section table lies within file buffer
+	SIZE_T sectTableEnd = (SIZE_T)pDos->e_lfanew + sizeof(IMAGE_NT_HEADERS64) + (SIZE_T)pNt->FileHeader.NumberOfSections * sizeof(IMAGE_SECTION_HEADER);
+	if (sectTableEnd > dwDataLength) SET_STATUS_AND_RETURN(14);
+
+	// Validate section raw ranges fit inside provided file buffer
+	{
+		PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(pNt);
+		for (WORD i = 0; i < pNt->FileHeader.NumberOfSections; ++i)
+		{
+			DWORD raw = sec[i].PointerToRawData;
+			DWORD rawSize = sec[i].SizeOfRawData;
+			if (rawSize && (raw > dwDataLength || raw + rawSize > dwDataLength))
+			{
+				SET_STATUS_AND_RETURN(12); // section raw out of bounds
+			}
+		}
+	}
 
 	// Allocate memory in remote (this code runs in remote already) — VirtualAlloc_remote with NULL base
 	PBYTE remoteImage = (PBYTE)VirtualAlloc_remote(NULL, imageSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
@@ -197,10 +198,16 @@ ULONG_PTR WINAPI MemoryLoadLibrary_Begin(INJECTPARAM* InjectParam)
 
 	// Copy headers (inline loop to avoid external calls)
 	SIZE_T headersSize = pNt->OptionalHeader.SizeOfHeaders;
-	{
+	// clamp to file size and remote image size
+	if (headersSize > dwDataLength) headersSize = dwDataLength;
+	if (headersSize > imageSize) headersSize = imageSize;
+	if (InjectParam) InjectParam->dwRemoteStatus = 241; // start header copy
+	__try {
 		unsigned char* d = remoteImage;
 		unsigned char* s = (unsigned char*)lpFileData;
 		for (SIZE_T i = 0; i < headersSize; ++i) d[i] = s[i];
+	} __except (1) {
+		SET_STATUS_AND_RETURN(90); // exception during header copy
 	}
 
 	// checkpoint: headers copied
@@ -208,27 +215,57 @@ ULONG_PTR WINAPI MemoryLoadLibrary_Begin(INJECTPARAM* InjectParam)
 
 	// Copy sections
 	PIMAGE_SECTION_HEADER pSection = IMAGE_FIRST_SECTION(pNt);
+	if (InjectParam) InjectParam->dwRemoteStatus = 261; // start sections copy
 	for (WORD i = 0; i < pNt->FileHeader.NumberOfSections; i++)
 	{
-		PBYTE dest = remoteImage + pSection[i].VirtualAddress;
-		PBYTE src = lpFileData + pSection[i].PointerToRawData;
-		SIZE_T copySize = pSection[i].SizeOfRawData;
-		if (copySize > 0)
+		DWORD va = pSection[i].VirtualAddress;
+		DWORD vsz = pSection[i].Misc.VirtualSize;
+		DWORD raw = pSection[i].PointerToRawData;
+		DWORD rawSize = pSection[i].SizeOfRawData;
+		PBYTE dest = remoteImage + va;
+		PBYTE src = lpFileData + raw;
+		SIZE_T copySize = rawSize;
+		// bounds safety: clamp copy to remaining image space
+		if ((SIZE_T)va >= imageSize) copySize = 0;
+		else if ((SIZE_T)va + copySize > imageSize) copySize = (SIZE_T)imageSize - va;
+		__try {
+			if (copySize > 0)
+			{
+				unsigned char* d = dest;
+				unsigned char* s = src;
+				for (SIZE_T j = 0; j < copySize; ++j) d[j] = s[j];
+			}
+		} __except (1) {
+			SET_STATUS_AND_RETURN(91); // exception during section copy
+		}
+		// zero-init the rest of VirtualSize beyond raw data (bss)
+		SIZE_T vremain = 0;
+		if (vsz > rawSize)
 		{
-			unsigned char* d = dest;
-			unsigned char* s = src;
-			for (SIZE_T j = 0; j < copySize; ++j) d[j] = s[j];
+			vremain = (SIZE_T)vsz - rawSize;
+			// clamp to image end
+			if ((SIZE_T)va + rawSize >= imageSize) vremain = 0;
+			else if ((SIZE_T)va + rawSize + vremain > imageSize) vremain = (SIZE_T)imageSize - ((SIZE_T)va + rawSize);
+			__try {
+				unsigned char* z = remoteImage + va + rawSize;
+				for (SIZE_T j = 0; j < vremain; ++j) z[j] = 0;
+			} __except (1) {
+				SET_STATUS_AND_RETURN(92); // exception during bss zero
+			}
 		}
 	}
 
 	// checkpoint: sections copied
 	if (InjectParam) InjectParam->dwRemoteStatus = 26;
 
-	// Perform base relocations if necessary
+	// Helper macro to compute pointers by RVA against the mapped remote image
+	#define RVA_REMOTE(ptrBase, rva) ((PBYTE)(ptrBase) + (SIZE_T)(rva))
+
+	// Perform base relocations if necessary (work entirely against remoteImage)
 	ULONG_PTR delta = (ULONG_PTR)remoteImage - pNt->OptionalHeader.ImageBase;
 	if (delta != 0 && pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size)
 	{
-		PIMAGE_BASE_RELOCATION rel = (PIMAGE_BASE_RELOCATION)(lpFileData + pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress);
+		PIMAGE_BASE_RELOCATION rel = (PIMAGE_BASE_RELOCATION)RVA_REMOTE(remoteImage, pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress);
 		SIZE_T maxRelSize = pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size;
 		SIZE_T processed = 0;
 		while (processed < maxRelSize && rel->SizeOfBlock)
@@ -242,8 +279,12 @@ ULONG_PTR WINAPI MemoryLoadLibrary_Begin(INJECTPARAM* InjectParam)
 				WORD offset = entry & 0x0FFF;
 				if (type == IMAGE_REL_BASED_DIR64)
 				{
-					ULONG_PTR* patch = (ULONG_PTR*)(remoteImage + rel->VirtualAddress + offset);
-					*patch = (ULONG_PTR)((ULONG_PTR)*patch + delta);
+					SIZE_T rva = (SIZE_T)rel->VirtualAddress + offset;
+					if (rva + sizeof(ULONG_PTR) <= imageSize)
+					{
+						ULONG_PTR* patch = (ULONG_PTR*)(RVA_REMOTE(remoteImage, rva));
+						*patch = (ULONG_PTR)((ULONG_PTR)*patch + delta);
+					}
 				}
 				// checkpoint: relocations applied
 				if (InjectParam) InjectParam->dwRemoteStatus = 27;
@@ -253,34 +294,32 @@ ULONG_PTR WINAPI MemoryLoadLibrary_Begin(INJECTPARAM* InjectParam)
 		}
 	}
 
-	// Resolve imports
+	// Resolve imports (work against remoteImage for RVAs)
 	if (pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress)
 	{
-		PIMAGE_IMPORT_DESCRIPTOR imp = (PIMAGE_IMPORT_DESCRIPTOR)(lpFileData + pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
+		PIMAGE_IMPORT_DESCRIPTOR imp = (PIMAGE_IMPORT_DESCRIPTOR)RVA_REMOTE(remoteImage, pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
 		while (imp->Name)
 		{
-			char* dllName = (char*)(lpFileData + imp->Name);
+			char* dllName = (char*)RVA_REMOTE(remoteImage, imp->Name);
 			HMODULE hMod = LoadLibraryA_remote(dllName);
 			if (!hMod) { /* failed to load dependency */ SET_STATUS_AND_RETURN(10); }
 
-			// thunk arrays
-			PIMAGE_THUNK_DATA64 oft = (PIMAGE_THUNK_DATA64)(lpFileData + imp->OriginalFirstThunk);
-			PIMAGE_THUNK_DATA64 ft = (PIMAGE_THUNK_DATA64)(remoteImage + imp->FirstThunk);
+			// Determine thunks; if OriginalFirstThunk is 0, use FirstThunk
+			PIMAGE_THUNK_DATA64 oft = (PIMAGE_THUNK_DATA64)(imp->OriginalFirstThunk ? RVA_REMOTE(remoteImage, imp->OriginalFirstThunk) : RVA_REMOTE(remoteImage, imp->FirstThunk));
+			PIMAGE_THUNK_DATA64 ft = (PIMAGE_THUNK_DATA64)RVA_REMOTE(remoteImage, imp->FirstThunk);
 			while (oft && oft->u1.AddressOfData)
 			{
 				FARPROC func = NULL;
 				if (oft->u1.Ordinal & IMAGE_ORDINAL_FLAG64)
 				{
-					// ordinal
 					UINT16 ord = (UINT16)(oft->u1.Ordinal & 0xFFFF);
 					func = (FARPROC)gp(hMod, (LPCSTR)(uintptr_t)ord);
 				}
 				else
 				{
-					PIMAGE_IMPORT_BY_NAME ibn = (PIMAGE_IMPORT_BY_NAME)(lpFileData + oft->u1.AddressOfData);
+					PIMAGE_IMPORT_BY_NAME ibn = (PIMAGE_IMPORT_BY_NAME)RVA_REMOTE(remoteImage, oft->u1.AddressOfData);
 					func = gp(hMod, (LPCSTR)ibn->Name);
 				}
-				// write into FT
 				ft->u1.Function = (ULONGLONG)func;
 				oft++;
 				ft++;
@@ -292,6 +331,46 @@ ULONG_PTR WINAPI MemoryLoadLibrary_Begin(INJECTPARAM* InjectParam)
 	// checkpoint: imports resolved
 	if (InjectParam) InjectParam->dwRemoteStatus = 28;
 
+	// Optional: show a MessageBox from shellcode to indicate loader is running
+	if (InjectParam && InjectParam->Name_User32 && InjectParam->Name_MessageBoxA && InjectParam->Str_MsgText && InjectParam->Str_MsgCaption)
+	{
+		HMODULE hUser32 = LoadLibraryA_remote(InjectParam->Name_User32);
+		if (hUser32)
+		{
+			FARPROC pMsg = gp(hUser32, InjectParam->Name_MessageBoxA);
+			if (pMsg)
+			{
+				if (InjectParam) InjectParam->dwRemoteStatus = 60; // about to show msgbox
+				typedef int (WINAPI* tMessageBoxA)(HWND, LPCSTR, LPCSTR, UINT);
+				tMessageBoxA MessageBoxA_remote = (tMessageBoxA)pMsg;
+				MessageBoxA_remote(NULL, InjectParam->Str_MsgText, InjectParam->Str_MsgCaption, 0);
+				if (InjectParam) InjectParam->dwRemoteStatus = 61; // msgbox shown
+			}
+		}
+	}
+
+	// Adjust memory protections per-section to be closer to loader behavior (optional, best-effort)
+	{
+		for (WORD i = 0; i < pNt->FileHeader.NumberOfSections; ++i)
+		{
+			DWORD scn = pSection[i].Characteristics;
+			DWORD newProt = PAGE_NOACCESS;
+			BOOL exec = (scn & IMAGE_SCN_MEM_EXECUTE) != 0;
+			BOOL read = (scn & IMAGE_SCN_MEM_READ) != 0;
+			BOOL write = (scn & IMAGE_SCN_MEM_WRITE) != 0;
+			if (exec)
+				newProt = write ? PAGE_EXECUTE_READWRITE : (read ? PAGE_EXECUTE_READ : PAGE_EXECUTE);
+			else
+				newProt = write ? PAGE_READWRITE : (read ? PAGE_READONLY : PAGE_NOACCESS);
+			SIZE_T size = pSection[i].Misc.VirtualSize;
+			if (size)
+			{
+				DWORD oldProt = 0;
+				VirtualProtect_remote(remoteImage + pSection[i].VirtualAddress, size, newProt, &oldProt);
+			}
+		}
+	}
+
 	// Call entry point
 	if (pNt->OptionalHeader.AddressOfEntryPoint)
 	{
@@ -300,13 +379,24 @@ ULONG_PTR WINAPI MemoryLoadLibrary_Begin(INJECTPARAM* InjectParam)
 		{
 			// checkpoint: about to call DllMain
 			if (InjectParam) InjectParam->dwRemoteStatus = 29;
-			DllEntry(remoteImage, DLL_PROCESS_ATTACH, NULL);
-			// after calling
-			if (InjectParam) InjectParam->dwRemoteStatus = 30;
+			// If SkipCallDllMain is set, avoid calling DllMain (diagnostic mode)
+			if (!InjectParam || InjectParam->SkipCallDllMain == 0)
+			{
+				DllEntry(remoteImage, DLL_PROCESS_ATTACH, NULL);
+				// after calling
+				if (InjectParam) InjectParam->dwRemoteStatus = 30;
+			}
+			else
+			{
+				// mark that DllMain was intentionally skipped
+				if (InjectParam) InjectParam->dwRemoteStatus = 31;
+			}
+			// do not overwrite the branch-specific status above
 		}
 	}
 
-	SET_STATUS_AND_RETURN(0);
+	// Success: preserve last status (e.g., 30 or 31) and return 0
+	return 0;
 #undef SET_STATUS_AND_RETURN
 	// 	PIMAGE_SECTION_HEADER pSectionHeader = NULL;
 
@@ -438,15 +528,13 @@ void Injectdll::RemoteMapLoadDll(HANDLE TargetProcess)
 
 	DWORD dwFileSize = 59904; // size of DllX64 from dllbin.h
 
-	// temporary: run smoke-test instead of full manual map
-	bool useSmoke = true; // set true to run RemoteSmoke_Begin test
-
-	WORD *pShellCodeBegin = (WORD *)(useSmoke ? RemoteSmoke_Begin : MemoryLoadLibrary_Begin);
+		// Use the manual-map shellcode (MemoryLoadLibrary_Begin / MemoryLoadLibrary_End)
+		WORD *pShellCodeBegin = (WORD *)MemoryLoadLibrary_Begin;
 
 	DWORD ShellCodeSize = 0;
 
 	// 计算ShellCode大小
-	ShellCodeSize = (DWORD)((ULONG_PTR)(useSmoke ? RemoteSmoke_End : MemoryLoadLibrary_End) - (ULONG_PTR)pShellCodeBegin);
+	ShellCodeSize = (DWORD)((ULONG_PTR)MemoryLoadLibrary_End - (ULONG_PTR)pShellCodeBegin);
 	printf("ShellCodeSize:%d\r\n", ShellCodeSize);
 
 	PBYTE pShellCodeBuffer = NULL;
@@ -454,37 +542,10 @@ void Injectdll::RemoteMapLoadDll(HANDLE TargetProcess)
 	{
 		pShellCodeBuffer = (PBYTE)malloc(ShellCodeSize);
 		RtlZeroMemory(pShellCodeBuffer, ShellCodeSize);
-	}
-
-	// If using smoke test, construct a tiny position-independent stub that writes 77 to
-	// [RCX + offsetof(INJECTPARAM, dwRemoteStatus)] and returns.
-	if (useSmoke)
-	{
-		// build machine code: mov eax,77; mov [rcx+disp32], eax; xor eax,eax; ret
-		SIZE_T statusOffset = offsetof(INJECTPARAM, dwRemoteStatus);
-		const int stubSize = 14; // 5 + 6 + 2 +1
-		if (pShellCodeBuffer) free(pShellCodeBuffer);
-		pShellCodeBuffer = (PBYTE)malloc(stubSize);
-		RtlZeroMemory(pShellCodeBuffer, stubSize);
-		int idx = 0;
-		// mov eax, imm32 (77)
-		pShellCodeBuffer[idx++] = 0xB8;
-		pShellCodeBuffer[idx++] = 0x4D; // 77
-		pShellCodeBuffer[idx++] = 0x00;
-		pShellCodeBuffer[idx++] = 0x00;
-		pShellCodeBuffer[idx++] = 0x00;
-		// mov [rcx + disp32], eax -> 0x89 0x81 <disp32>
-		pShellCodeBuffer[idx++] = 0x89;
-		pShellCodeBuffer[idx++] = 0x81;
-		// write disp32 little-endian
-		*(DWORD*)(pShellCodeBuffer + idx) = (DWORD)statusOffset;
-		idx += 4;
-		// xor eax,eax
-		pShellCodeBuffer[idx++] = 0x31;
-		pShellCodeBuffer[idx++] = 0xC0;
-		// ret
-		pShellCodeBuffer[idx++] = 0xC3;
-		ShellCodeSize = stubSize;
+		// Copy the compiled manual-map function bytes into the shellcode buffer.
+		// Note: copying compiled function bytes into another process is fragile (RIP-relative refs),
+		// but the user requested to always inject MemoryLoadLibrary_Begin.
+		RtlCopyMemory(pShellCodeBuffer, (PVOID)pShellCodeBegin, ShellCodeSize);
 	}
 
 	// We will NOT pass local function pointers to the remote process. The shellcode
@@ -533,10 +594,31 @@ void Injectdll::RemoteMapLoadDll(HANDLE TargetProcess)
 		return;
 	}
 
+	// Prepare API name strings to embed after the INJECTPARAM in remote memory
+	const char* sGetProcAddress = "GetProcAddress";
+	const char* sLoadLibraryA   = "LoadLibraryA";
+	const char* sVirtualAlloc   = "VirtualAlloc";
+	const char* sVirtualProtect = "VirtualProtect";
+	const char* sUser32         = "user32.dll";
+	const char* sMessageBoxA    = "MessageBoxA";
+	const char* sMsgText        = "Shellcode loaded";
+	const char* sMsgCaption     = "ManualMap";
+	SIZE_T lenGetProc = (SIZE_T)strlen(sGetProcAddress) + 1;
+	SIZE_T lenLoadLib = (SIZE_T)strlen(sLoadLibraryA) + 1;
+	SIZE_T lenVirtAlloc = (SIZE_T)strlen(sVirtualAlloc) + 1;
+	SIZE_T lenVirtProt = (SIZE_T)strlen(sVirtualProtect) + 1;
+	SIZE_T lenUser32 = (SIZE_T)strlen(sUser32) + 1;
+	SIZE_T lenMsgA   = (SIZE_T)strlen(sMessageBoxA) + 1;
+	SIZE_T lenTxt    = (SIZE_T)strlen(sMsgText) + 1;
+	SIZE_T lenCap    = (SIZE_T)strlen(sMsgCaption) + 1;
+	SIZE_T paramSize = sizeof(InjectParam);
+	SIZE_T namesSize = lenGetProc + lenLoadLib + lenVirtAlloc + lenVirtProt + lenUser32 + lenMsgA + lenTxt + lenCap;
+	SIZE_T totalParamSize = paramSize + namesSize;
+
 	PBYTE pRemoteParamAddr = (PBYTE)VirtualAllocEx(
 		TargetProcess,
 		NULL,
-		sizeof(InjectParam),
+		totalParamSize,
 		MEM_COMMIT | MEM_RESERVE,
 		PAGE_READWRITE
 	);
@@ -553,11 +635,36 @@ void Injectdll::RemoteMapLoadDll(HANDLE TargetProcess)
 	printf("Remote DLL addr: %p\n", pRemoteDllAddr);
 	printf("Remote shell addr: %p\n", pRemoteShellAddr);
 	printf("Remote param addr: %p\n", pRemoteParamAddr);
+	printf("Param size total: %llu bytes\n", (unsigned long long)totalParamSize);
+
+	// Layout: [INJECTPARAM]["GetProcAddress\0"]["LoadLibraryA\0"]["VirtualAlloc\0"]["VirtualProtect\0"]["user32.dll\0"]["MessageBoxA\0"]["Shellcode loaded\0"]["ManualMap\0"]
+	// Compute remote addresses for name strings
+	PBYTE namesBase = pRemoteParamAddr + paramSize;
+	PBYTE remoteGetProc = namesBase;
+	PBYTE remoteLoadLib = remoteGetProc + lenGetProc;
+	PBYTE remoteVirtAlloc = remoteLoadLib + lenLoadLib;
+	PBYTE remoteVirtProt = remoteVirtAlloc + lenVirtAlloc;
+	PBYTE remoteUser32 = remoteVirtProt + lenVirtProt;
+	PBYTE remoteMsgA   = remoteUser32 + lenUser32;
+	PBYTE remoteTxt    = remoteMsgA + lenMsgA;
+	PBYTE remoteCap    = remoteTxt + lenTxt;
 
 	// Set remote pointer in InjectParam
 	InjectParam.lpFileData = pRemoteDllAddr;
 	// initialize remote status field
 	InjectParam.dwRemoteStatus = 0;
+	// Enable calling DllMain for this run to show message box as well
+	InjectParam.SkipCallDllMain = 0;
+
+	// Fill name pointers (remote addresses)
+	InjectParam.Name_GetProcAddress = (char*)remoteGetProc;
+	InjectParam.Name_LoadLibraryA   = (char*)remoteLoadLib;
+	InjectParam.Name_VirtualAlloc   = (char*)remoteVirtAlloc;
+	InjectParam.Name_VirtualProtect = (char*)remoteVirtProt;
+	InjectParam.Name_User32         = (char*)remoteUser32;
+	InjectParam.Name_MessageBoxA    = (char*)remoteMsgA;
+	InjectParam.Str_MsgText         = (char*)remoteTxt;
+	InjectParam.Str_MsgCaption      = (char*)remoteCap;
 
 	// Declare remote thread handle early so goto cleanup_remote doesn't skip its initialization
 	HANDLE hRemoteThread = NULL;
@@ -582,15 +689,12 @@ void Injectdll::RemoteMapLoadDll(HANDLE TargetProcess)
 		}
 	};
 
-	// 写入 DLL 数据 到目标进程 (skip when running smoke test)
-	if (!useSmoke)
+	// 写入 DLL 数据 到目标进程
+	if (!WriteProcessMemory(TargetProcess, pRemoteDllAddr, DllX64, dwFileSize, &dwWrited) || dwWrited != dwFileSize)
 	{
-		if (!WriteProcessMemory(TargetProcess, pRemoteDllAddr, DllX64, dwFileSize, &dwWrited) || dwWrited != dwFileSize)
-		{
-			printf("WriteProcessMemory DLL failed: %u (written %llu)\n", GetLastError(), (unsigned long long)dwWrited);
-			cleanup_remote();
-			return;
-		}
+		printf("WriteProcessMemory DLL failed: %u (written %llu)\n", GetLastError(), (unsigned long long)dwWrited);
+		cleanup_remote();
+		return;
 	}
 
 	// 写入 ShellCode
@@ -601,12 +705,72 @@ void Injectdll::RemoteMapLoadDll(HANDLE TargetProcess)
 		return;
 	}
 
-	// 写入参数结构（参数里包含远程 DLL 地址）
+	// Diagnostic: read back shellcode from remote and compare first/last bytes to ensure integrity
+	{
+		PBYTE verifyBuf = (PBYTE)malloc(ShellCodeSize);
+		SIZE_T bytesRead = 0;
+		RtlZeroMemory(verifyBuf, ShellCodeSize);
+		if (ReadProcessMemory(TargetProcess, pRemoteShellAddr, verifyBuf, ShellCodeSize, &bytesRead) && bytesRead == ShellCodeSize)
+		{
+			int mismatch = 0;
+			if (ShellCodeSize >= 1 && verifyBuf[0] != pShellCodeBuffer[0]) mismatch = 1;
+			if (ShellCodeSize >= 2 && verifyBuf[ShellCodeSize-1] != pShellCodeBuffer[ShellCodeSize-1]) mismatch |= 2;
+			if (mismatch)
+			{
+				printf("Warning: remote shellcode differs from local buffer (mismatch mask=%d).\n", mismatch);
+			}
+			else
+			{
+				printf("Remote shellcode write verified (first/last bytes match).\n");
+			}
+		}
+		else
+		{
+			printf("Warning: ReadProcessMemory verify failed: %u\n", GetLastError());
+		}
+		free(verifyBuf);
+	}
+
+	// 写入参数结构（参数里包含远程 DLL 地址与字符串指针）
 	if (!WriteProcessMemory(TargetProcess, pRemoteParamAddr, &InjectParam, sizeof(InjectParam), &dwWrited) || dwWrited != sizeof(InjectParam))
 	{
 		printf("WriteProcessMemory param failed: %u (written %llu)\n", GetLastError(), (unsigned long long)dwWrited);
 		cleanup_remote();
 		return;
+	}
+
+	// 写入紧随其后的 API 名称字符串块
+	SIZE_T wroteNames = 0;
+	// Copy names into a single local buffer in the same layout
+	SIZE_T localBufSize = namesSize;
+	PBYTE localNames = (PBYTE)malloc(localBufSize);
+	if (!localNames) { printf("malloc failed for localNames\n"); cleanup_remote(); return; }
+	SIZE_T off = 0;
+	memcpy(localNames + off, sGetProcAddress, lenGetProc); off += lenGetProc;
+	memcpy(localNames + off, sLoadLibraryA,   lenLoadLib);  off += lenLoadLib;
+	memcpy(localNames + off, sVirtualAlloc,   lenVirtAlloc);off += lenVirtAlloc;
+	memcpy(localNames + off, sVirtualProtect, lenVirtProt); off += lenVirtProt;
+	memcpy(localNames + off, sUser32,         lenUser32);   off += lenUser32;
+	memcpy(localNames + off, sMessageBoxA,    lenMsgA);     off += lenMsgA;
+	memcpy(localNames + off, sMsgText,        lenTxt);      off += lenTxt;
+	memcpy(localNames + off, sMsgCaption,     lenCap);      off += lenCap;
+	if (!WriteProcessMemory(TargetProcess, namesBase, localNames, localBufSize, &wroteNames) || wroteNames != localBufSize)
+	{
+		printf("WriteProcessMemory names failed: %u (written %llu)\n", GetLastError(), (unsigned long long)wroteNames);
+		free(localNames);
+		cleanup_remote();
+		return;
+	}
+	free(localNames);
+
+	// Ensure remote shellcode page is executable (in case VirtualAllocEx reserved non-exec by policy)
+	{
+		DWORD oldProt = 0;
+		if (!VirtualProtectEx(TargetProcess, pRemoteShellAddr, ShellCodeSize, PAGE_EXECUTE_READ, &oldProt))
+		{
+			// If VirtualProtectEx fails, print warning but still try CreateRemoteThread
+			printf("Warning: VirtualProtectEx failed for shellcode: %u\n", GetLastError());
+		}
 	}
 
 	// 创建远程线程，传入远程 shellcode 地址 和远程参数地址
@@ -618,40 +782,77 @@ void Injectdll::RemoteMapLoadDll(HANDLE TargetProcess)
 		return;
 	}
 
-	// 等待远程线程完成（10秒超时），以便获取 shellcode 的返回码用于调试
-	DWORD waitRes = WaitForSingleObject(hRemoteThread, 10000); // 10s
-	if (waitRes == WAIT_OBJECT_0)
+	// 轮询式等待（最多10秒）：边等边读 dwRemoteStatus，避免目标先崩溃导致错过早期状态
+	DWORD totalMs = 10000;
+	DWORD endTick = GetTickCount() + totalMs;
+	DWORD lastStatus = 0xFFFFFFFF;
+	for (;;)
+	{
+		DWORD now = GetTickCount();
+		DWORD timeout = (now >= endTick) ? 0 : (endTick - now);
+		DWORD slice = (timeout > 50 ? 50 : timeout);
+		DWORD wr = WaitForSingleObject(hRemoteThread, slice);
+
+		// 尝试读取 dwRemoteStatus（仅4字节），即使目标稍后会崩溃，也尽量捕获最近进度
+		DWORD status = 0; SIZE_T br = 0;
+		if (ReadProcessMemory(TargetProcess, (PBYTE)pRemoteParamAddr + offsetof(INJECTPARAM, dwRemoteStatus), &status, sizeof(status), &br) && br == sizeof(status))
+		{
+			if (status != lastStatus)
+			{
+				printf("[poll] Remote dwRemoteStatus: %lu\n", (unsigned long)status);
+				lastStatus = status;
+			}
+		}
+		else if (GetLastError() == 299)
+		{
+			// 部分读取，忽略
+		}
+
+		if (wr == WAIT_OBJECT_0)
+		{
+			break;
+		}
+		if (wr == WAIT_TIMEOUT)
+		{
+			if (slice == 0) { printf("Wait timed out (10s)\n"); break; }
+			continue;
+		}
+		if (wr == WAIT_FAILED)
+		{
+			printf("WaitForSingleObject failed: %u\n", GetLastError());
+			break;
+		}
+	}
+
+	// 线程结束后获取返回码
 	{
 		DWORD exitCode = 0;
 		if (GetExitCodeThread(hRemoteThread, &exitCode))
-		{
 			printf("Remote thread exited with code: %lu\n", (unsigned long)exitCode);
-		}
 		else
-		{
 			printf("GetExitCodeThread failed: %u\n", GetLastError());
-		}
+	}
 
-		// Read back INJECTPARAM from remote to get dwRemoteStatus
-		INJECTPARAM remoteParam;
-		SIZE_T bytesRead = 0;
-		RtlZeroMemory(&remoteParam, sizeof(remoteParam));
+	// 最后再尝试完整读取参数结构
+	{
+		INJECTPARAM remoteParam; SIZE_T bytesRead = 0; RtlZeroMemory(&remoteParam, sizeof(remoteParam));
 		if (ReadProcessMemory(TargetProcess, pRemoteParamAddr, &remoteParam, sizeof(remoteParam), &bytesRead) && bytesRead == sizeof(remoteParam))
 		{
-			printf("Remote dwRemoteStatus: %lu\n", (unsigned long)remoteParam.dwRemoteStatus);
+			printf("Remote dwRemoteStatus (final): %lu\n", (unsigned long)remoteParam.dwRemoteStatus);
 		}
 		else
 		{
-			printf("ReadProcessMemory for INJECTPARAM failed: %u\n", GetLastError());
+			DWORD err = GetLastError();
+			printf("ReadProcessMemory for INJECTPARAM failed: %u\n", err);
+			if (err == 299)
+			{
+				DWORD status2 = 0; SIZE_T br2 = 0;
+				if (ReadProcessMemory(TargetProcess, (PBYTE)pRemoteParamAddr + offsetof(INJECTPARAM, dwRemoteStatus), &status2, sizeof(status2), &br2) && br2 == sizeof(status2))
+				{
+					printf("Partial read recovered dwRemoteStatus (final): %lu\n", (unsigned long)status2);
+				}
+			}
 		}
-	}
-	else if (waitRes == WAIT_TIMEOUT)
-	{
-		printf("WaitForSingleObject timed out waiting for remote thread\n");
-	}
-	else
-	{
-		printf("WaitForSingleObject failed: %u\n", GetLastError());
 	}
 
 	printf("写入DLL内容完毕\r\n");

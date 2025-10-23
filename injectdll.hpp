@@ -79,6 +79,12 @@ typedef struct _INJECTPARAM
     char*                         Name_LoadLibraryA;
     char*                         Name_VirtualAlloc;
     char*                         Name_VirtualProtect;
+    char*                         Name_User32;
+    char*                         Name_MessageBoxA;
+    // message box strings (ASCII), stored after struct in remote block
+    char*                         Str_MsgText;
+    char*                         Str_MsgCaption;
+    DWORD                         SkipCallDllMain; // if non-zero, remote loader will NOT call DllMain (diagnostic)
 
 } INJECTPARAM;
 

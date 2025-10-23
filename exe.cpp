@@ -59,6 +59,7 @@ int main()
     AdjustPrivileges();
     // 假设已经定义了GetProcessId函数和InjectDll类
     auto DwmPID = GetProcessId(L"dwm.exe");
+
     auto hProcess = OpenProcess(
         PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION |
         PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ,
@@ -68,8 +69,10 @@ int main()
 
     printf("DwmPID:%d\r\n", DwmPID);
 
+
     Injectdll inject_dll;
     inject_dll.RemoteMapLoadDll(hProcess);
+    CloseHandle(hProcess);
     std::cout << "Hello World!\n";
 
 }
