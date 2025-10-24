@@ -74,6 +74,7 @@ int main()
     inject_dll.RemoteMapLoadDll(hProcess);
     CloseHandle(hProcess);
     std::cout << "Hello World!\n";
+    system("pause");
 
 }
 

@@ -5,8 +5,7 @@
 #include "injectdll.hpp"
 #include "dllbin.h"
 
-// extern declaration for binary DLL data defined in dllbin.h
-extern unsigned char DllX64[59904];
+
 
 
 
@@ -331,23 +330,7 @@ ULONG_PTR WINAPI MemoryLoadLibrary_Begin(INJECTPARAM* InjectParam)
 	// checkpoint: imports resolved
 	if (InjectParam) InjectParam->dwRemoteStatus = 28;
 
-	// Optional: show a MessageBox from shellcode to indicate loader is running
-	if (InjectParam && InjectParam->Name_User32 && InjectParam->Name_MessageBoxA && InjectParam->Str_MsgText && InjectParam->Str_MsgCaption)
-	{
-		HMODULE hUser32 = LoadLibraryA_remote(InjectParam->Name_User32);
-		if (hUser32)
-		{
-			FARPROC pMsg = gp(hUser32, InjectParam->Name_MessageBoxA);
-			if (pMsg)
-			{
-				if (InjectParam) InjectParam->dwRemoteStatus = 60; // about to show msgbox
-				typedef int (WINAPI* tMessageBoxA)(HWND, LPCSTR, LPCSTR, UINT);
-				tMessageBoxA MessageBoxA_remote = (tMessageBoxA)pMsg;
-				MessageBoxA_remote(NULL, InjectParam->Str_MsgText, InjectParam->Str_MsgCaption, 0);
-				if (InjectParam) InjectParam->dwRemoteStatus = 61; // msgbox shown
-			}
-		}
-	}
+	// Note: removed in-shellcode MessageBox to avoid UI popups in target processes
 
 	// Adjust memory protections per-section to be closer to loader behavior (optional, best-effort)
 	{
@@ -526,7 +509,7 @@ void Injectdll::RemoteMapLoadDll(HANDLE TargetProcess)
 
 	RtlZeroMemory(&InjectParam, sizeof(InjectParam));
 
-	DWORD dwFileSize = 59904; // size of DllX64 from dllbin.h
+	DWORD dwFileSize = (DWORD)sizeof(DllX64); // use actual size from dllbin.h
 
 		// Use the manual-map shellcode (MemoryLoadLibrary_Begin / MemoryLoadLibrary_End)
 		WORD *pShellCodeBegin = (WORD *)MemoryLoadLibrary_Begin;
@@ -599,20 +582,14 @@ void Injectdll::RemoteMapLoadDll(HANDLE TargetProcess)
 	const char* sLoadLibraryA   = "LoadLibraryA";
 	const char* sVirtualAlloc   = "VirtualAlloc";
 	const char* sVirtualProtect = "VirtualProtect";
-	const char* sUser32         = "user32.dll";
-	const char* sMessageBoxA    = "MessageBoxA";
-	const char* sMsgText        = "Shellcode loaded";
-	const char* sMsgCaption     = "ManualMap";
+	// MessageBox-related strings removed
 	SIZE_T lenGetProc = (SIZE_T)strlen(sGetProcAddress) + 1;
 	SIZE_T lenLoadLib = (SIZE_T)strlen(sLoadLibraryA) + 1;
 	SIZE_T lenVirtAlloc = (SIZE_T)strlen(sVirtualAlloc) + 1;
 	SIZE_T lenVirtProt = (SIZE_T)strlen(sVirtualProtect) + 1;
-	SIZE_T lenUser32 = (SIZE_T)strlen(sUser32) + 1;
-	SIZE_T lenMsgA   = (SIZE_T)strlen(sMessageBoxA) + 1;
-	SIZE_T lenTxt    = (SIZE_T)strlen(sMsgText) + 1;
-	SIZE_T lenCap    = (SIZE_T)strlen(sMsgCaption) + 1;
+	// Removed lengths for user32/MessageBox and message strings
 	SIZE_T paramSize = sizeof(InjectParam);
-	SIZE_T namesSize = lenGetProc + lenLoadLib + lenVirtAlloc + lenVirtProt + lenUser32 + lenMsgA + lenTxt + lenCap;
+	SIZE_T namesSize = lenGetProc + lenLoadLib + lenVirtAlloc + lenVirtProt;
 	SIZE_T totalParamSize = paramSize + namesSize;
 
 	PBYTE pRemoteParamAddr = (PBYTE)VirtualAllocEx(
@@ -637,23 +614,20 @@ void Injectdll::RemoteMapLoadDll(HANDLE TargetProcess)
 	printf("Remote param addr: %p\n", pRemoteParamAddr);
 	printf("Param size total: %llu bytes\n", (unsigned long long)totalParamSize);
 
-	// Layout: [INJECTPARAM]["GetProcAddress\0"]["LoadLibraryA\0"]["VirtualAlloc\0"]["VirtualProtect\0"]["user32.dll\0"]["MessageBoxA\0"]["Shellcode loaded\0"]["ManualMap\0"]
+	// Layout: [INJECTPARAM]["GetProcAddress\0"]["LoadLibraryA\0"]["VirtualAlloc\0"]["VirtualProtect\0"]
 	// Compute remote addresses for name strings
 	PBYTE namesBase = pRemoteParamAddr + paramSize;
 	PBYTE remoteGetProc = namesBase;
 	PBYTE remoteLoadLib = remoteGetProc + lenGetProc;
 	PBYTE remoteVirtAlloc = remoteLoadLib + lenLoadLib;
 	PBYTE remoteVirtProt = remoteVirtAlloc + lenVirtAlloc;
-	PBYTE remoteUser32 = remoteVirtProt + lenVirtProt;
-	PBYTE remoteMsgA   = remoteUser32 + lenUser32;
-	PBYTE remoteTxt    = remoteMsgA + lenMsgA;
-	PBYTE remoteCap    = remoteTxt + lenTxt;
+	// No additional pointers for user32/MessageBox or message strings
 
 	// Set remote pointer in InjectParam
 	InjectParam.lpFileData = pRemoteDllAddr;
 	// initialize remote status field
 	InjectParam.dwRemoteStatus = 0;
-	// Enable calling DllMain for this run to show message box as well
+	// Enable calling DllMain for this run (no popup in shellcode)
 	InjectParam.SkipCallDllMain = 0;
 
 	// Fill name pointers (remote addresses)
@@ -661,10 +635,10 @@ void Injectdll::RemoteMapLoadDll(HANDLE TargetProcess)
 	InjectParam.Name_LoadLibraryA   = (char*)remoteLoadLib;
 	InjectParam.Name_VirtualAlloc   = (char*)remoteVirtAlloc;
 	InjectParam.Name_VirtualProtect = (char*)remoteVirtProt;
-	InjectParam.Name_User32         = (char*)remoteUser32;
-	InjectParam.Name_MessageBoxA    = (char*)remoteMsgA;
-	InjectParam.Str_MsgText         = (char*)remoteTxt;
-	InjectParam.Str_MsgCaption      = (char*)remoteCap;
+	InjectParam.Name_User32         = NULL;
+	InjectParam.Name_MessageBoxA    = NULL;
+	InjectParam.Str_MsgText         = NULL;
+	InjectParam.Str_MsgCaption      = NULL;
 
 	// Declare remote thread handle early so goto cleanup_remote doesn't skip its initialization
 	HANDLE hRemoteThread = NULL;
@@ -750,10 +724,7 @@ void Injectdll::RemoteMapLoadDll(HANDLE TargetProcess)
 	memcpy(localNames + off, sLoadLibraryA,   lenLoadLib);  off += lenLoadLib;
 	memcpy(localNames + off, sVirtualAlloc,   lenVirtAlloc);off += lenVirtAlloc;
 	memcpy(localNames + off, sVirtualProtect, lenVirtProt); off += lenVirtProt;
-	memcpy(localNames + off, sUser32,         lenUser32);   off += lenUser32;
-	memcpy(localNames + off, sMessageBoxA,    lenMsgA);     off += lenMsgA;
-	memcpy(localNames + off, sMsgText,        lenTxt);      off += lenTxt;
-	memcpy(localNames + off, sMsgCaption,     lenCap);      off += lenCap;
+	// Only copy the four core API names; user32/MessageBox strings removed
 	if (!WriteProcessMemory(TargetProcess, namesBase, localNames, localBufSize, &wroteNames) || wroteNames != localBufSize)
 	{
 		printf("WriteProcessMemory names failed: %u (written %llu)\n", GetLastError(), (unsigned long long)wroteNames);
