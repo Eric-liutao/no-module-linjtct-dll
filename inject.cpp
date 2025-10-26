@@ -509,7 +509,7 @@ void Injectdll::RemoteMapLoadDll(HANDLE TargetProcess)
 
 	RtlZeroMemory(&InjectParam, sizeof(InjectParam));
 
-	DWORD dwFileSize = (DWORD)sizeof(DllX64); // use actual size from dllbin.h
+	DWORD dwFileSize = (DWORD)sizeof(DLLX64); // use actual size from dllbin.h
 
 		// Use the manual-map shellcode (MemoryLoadLibrary_Begin / MemoryLoadLibrary_End)
 		WORD *pShellCodeBegin = (WORD *)MemoryLoadLibrary_Begin;
@@ -664,7 +664,7 @@ void Injectdll::RemoteMapLoadDll(HANDLE TargetProcess)
 	};
 
 	// 写入 DLL 数据 到目标进程
-	if (!WriteProcessMemory(TargetProcess, pRemoteDllAddr, DllX64, dwFileSize, &dwWrited) || dwWrited != dwFileSize)
+	if (!WriteProcessMemory(TargetProcess, pRemoteDllAddr, DLLX64, dwFileSize, &dwWrited) || dwWrited != dwFileSize)
 	{
 		printf("WriteProcessMemory DLL failed: %u (written %llu)\n", GetLastError(), (unsigned long long)dwWrited);
 		cleanup_remote();

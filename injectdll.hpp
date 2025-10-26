@@ -96,5 +96,5 @@ class Injectdll
 }; 
 
 // external binary blob declared in dllbin.h
-extern unsigned char DllX64[];
+extern unsigned char DLLX64[];
 
